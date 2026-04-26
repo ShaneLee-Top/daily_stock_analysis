@@ -530,6 +530,38 @@ class DataFetcherManager:
         with self._fetchers_lock:
             return list(getattr(self, "_fetchers", []))
 
+        def _select_fetchers_for_stock(self, stock_code: str) -> List[BaseFetcher]:
+        """按股票市场选择数据源，避免港股/美股误走 A 股源。"""
+        normalized = normalize_stock_code(stock_code)
+        fetchers = self._get_fetchers_snapshot()
+
+        is_us = _is_us_market(normalized)
+        is_hk = (not is_us) and _is_hk_market(normalized)
+
+        if is_us:
+            allowed = {"LongbridgeFetcher", "YfinanceFetcher"}
+        elif is_hk:
+            allowed = {"LongbridgeFetcher", "YfinanceFetcher", "AkshareFetcher"}
+        else:
+            # A 股保留国内数据源，但先去掉最慢、最容易卡住的 Pytdx/Baostock
+            allowed = {"TushareFetcher", "EfinanceFetcher", "AkshareFetcher", "YfinanceFetcher"}
+
+        selected = [f for f in fetchers if f.name in allowed]
+
+        if not selected:
+            logger.warning(
+                "[数据源选择] %s 未匹配到专用数据源，回退到全部数据源",
+                stock_code,
+            )
+            return fetchers
+
+        logger.info(
+            "[数据源选择] %s -> %s",
+            stock_code,
+            ", ".join(f.name for f in selected),
+        )
+        return selected
+        
     def _get_fetcher_call_lock(self, fetcher: BaseFetcher) -> RLock:
         self._ensure_concurrency_guards()
         fetcher_id = id(fetcher)
@@ -879,10 +911,10 @@ class DataFetcherManager:
                 efinance,
                 akshare,
                 tushare,
-                pytdx,
-                baostock,
                 yfinance,
                 longbridge,
+                # pytdx,
+                # baostock,
             ]
 
             # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
@@ -933,7 +965,8 @@ class DataFetcherManager:
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
 
-        fetchers = self._get_fetchers_snapshot()
+        # fetchers = self._get_fetchers_snapshot()
+        fetchers = self._select_fetchers_for_stock(stock_code)
         errors = []
         total_fetchers = len(fetchers)
         request_start = time.time()
@@ -996,6 +1029,60 @@ class DataFetcherManager:
             logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
             raise DataFetchError(error_summary)
 
+                # 港股使用 Longbridge/YFinance/AkShare 专用路由，避免误走 A 股数据源
+        if is_hk:
+            prefer_lb = self._longbridge_preferred()
+            source_order = (
+                ["LongbridgeFetcher", "YfinanceFetcher", "AkshareFetcher"]
+                if prefer_lb
+                else ["YfinanceFetcher", "LongbridgeFetcher", "AkshareFetcher"]
+            )
+
+            for src_name in source_order:
+                for attempt, fetcher in enumerate(fetchers, start=1):
+                    if fetcher.name != src_name:
+                        continue
+
+                    try:
+                        role = "首选" if src_name == source_order[0] else "兜底"
+                        logger.info(
+                            f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] "
+                            f"港股 {stock_code} {role}路由..."
+                        )
+
+                        df = self._call_fetcher_method(
+                            fetcher,
+                            "get_daily_data",
+                            stock_code=stock_code,
+                            start_date=start_date,
+                            end_date=end_date,
+                            days=days,
+                        )
+
+                        if df is not None and not df.empty:
+                            elapsed = time.time() - request_start
+                            logger.info(
+                                f"[数据源完成] {stock_code} 使用 [{fetcher.name}] 获取成功: "
+                                f"rows={len(df)}, elapsed={elapsed:.2f}s"
+                            )
+                            return df, fetcher.name
+
+                    except Exception as e:
+                        error_type, error_reason = summarize_exception(e)
+                        error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
+                        logger.warning(
+                            f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
+                            f"error_type={error_type}, reason={error_reason}"
+                        )
+                        errors.append(error_msg)
+
+                    break
+
+            error_summary = f"港股 {stock_code} 获取失败:\n" + "\n".join(errors)
+            elapsed = time.time() - request_start
+            logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
+            raise DataFetchError(error_summary)
+            
         for attempt, fetcher in enumerate(fetchers, start=1):
             try:
                 logger.info(f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}...")
