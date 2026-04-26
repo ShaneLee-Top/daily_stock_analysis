@@ -530,7 +530,7 @@ class DataFetcherManager:
         with self._fetchers_lock:
             return list(getattr(self, "_fetchers", []))
 
-        def _select_fetchers_for_stock(self, stock_code: str) -> List[BaseFetcher]:
+    def _select_fetchers_for_stock(self, stock_code: str) -> List[BaseFetcher]:
         """按股票市场选择数据源，避免港股/美股误走 A 股源。"""
         normalized = normalize_stock_code(stock_code)
         fetchers = self._get_fetchers_snapshot()
